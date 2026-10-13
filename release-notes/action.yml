@@ -1,0 +1,156 @@
+name: Render package release notes
+description: >-
+  Render the changelog.yml entry for an Elastic package version as markdown,
+  ready to pass to a GitHub release.
+author: Nate Shoffner
+
+branding:
+  icon: file-text
+  color: blue
+
+inputs:
+  changelog-path:
+    description: Path to the package changelog.yml.
+    required: false
+    default: changelog.yml
+  version:
+    description: >-
+      Package version to render notes for. Defaults to the tag with the tag
+      prefix removed.
+    required: false
+    default: ''
+  tag:
+    description: >-
+      Release tag the version is derived from. Ignored when "version" is set.
+      Defaults to the tag or branch that triggered the run.
+    required: false
+    default: ${{ github.ref_name }}
+  tag-prefix:
+    description: >-
+      Prefix stripped from the tag to get the version. Pass an empty string for
+      unprefixed tags. Ignored when "version" is set.
+    required: false
+    default: v
+  footer:
+    description: >-
+      Markdown appended after the changelog body, separated by a blank line.
+      Pass an empty string to omit it.
+    required: false
+    default: >-
+      Install with **Kibana > Integrations > Upload integration**, or
+      `elastic-package install --zip <file>`.
+  output-file:
+    description: >-
+      File to write the notes to. Defaults to release-notes.md in the runner
+      temp directory.
+    required: false
+    default: ''
+  fail-if-missing:
+    description: >-
+      Fail the step when the changelog has no entry for the version, instead of
+      rendering a placeholder.
+    required: false
+    default: 'false'
+
+outputs:
+  notes:
+    description: The rendered markdown.
+    value: ${{ steps.render.outputs.notes }}
+  notes-file:
+    description: Path to the file holding the rendered markdown.
+    value: ${{ steps.render.outputs.notes-file }}
+  version:
+    description: The version the notes were rendered for.
+    value: ${{ steps.render.outputs.version }}
+  found:
+    description: '"true" when the changelog had an entry for the version.'
+    value: ${{ steps.render.outputs.found }}
+
+runs:
+  using: composite
+  steps:
+    - name: Ensure PyYAML is available
+      shell: bash
+      run: |
+        set -euo pipefail
+        if python3 -c 'import yaml' 2>/dev/null; then
+          exit 0
+        fi
+        # Ubuntu runner images mark the system interpreter as externally
+        # managed (PEP 668), so retry with the override before giving up.
+        python3 -m pip install --quiet --disable-pip-version-check pyyaml \
+          || python3 -m pip install --quiet --disable-pip-version-check --break-system-packages pyyaml \
+          || {
+               echo "::error::PyYAML is required by this action; run actions/setup-python or install python3-yaml before it"
+               exit 1
+             }
+
+    - name: Render release notes
+      id: render
+      shell: bash
+      env:
+        CHANGELOG_PATH: ${{ inputs.changelog-path }}
+        INPUT_VERSION: ${{ inputs.version }}
+        TAG: ${{ inputs.tag }}
+        TAG_PREFIX: ${{ inputs.tag-prefix }}
+        FOOTER: ${{ inputs.footer }}
+        OUTPUT_FILE: ${{ inputs.output-file }}
+        FAIL_IF_MISSING: ${{ inputs.fail-if-missing }}
+        # Scripts are shared by the actions in this repository, so they live at
+        # the repository root rather than inside each action directory.
+        SCRIPT: ${{ github.action_path }}/../scripts/release_notes.py
+      run: |
+        set -euo pipefail
+
+        if [ -n "$INPUT_VERSION" ]; then
+          version="$INPUT_VERSION"
+        else
+          case "$TAG" in
+            "$TAG_PREFIX"*) version="${TAG#"$TAG_PREFIX"}" ;;
+            *)
+              echo "::error::Tag '${TAG}' does not start with the expected prefix '${TAG_PREFIX}'"
+              exit 1
+              ;;
+          esac
+        fi
+
+        if [ -z "$version" ]; then
+          echo "::error::Could not work out a version to render notes for"
+          exit 1
+        fi
+
+        notes_file="${OUTPUT_FILE:-${RUNNER_TEMP}/release-notes.md}"
+        mkdir -p "$(dirname "$notes_file")"
+
+        # Exit status 2 means "no entry for this version"; the placeholder notes
+        # are written either way, so whether that is fatal is decided here.
+        status=0
+        python3 "$SCRIPT" \
+          --changelog "$CHANGELOG_PATH" \
+          --version "$version" \
+          --footer "$FOOTER" \
+          --output "$notes_file" || status=$?
+
+        case "$status" in
+          0) found=true ;;
+          2) found=false ;;
+          *) exit "$status" ;;
+        esac
+
+        if [ "$found" != "true" ] && [ "$FAIL_IF_MISSING" = "true" ]; then
+          echo "::error::${CHANGELOG_PATH} has no entry for version ${version}"
+          exit 1
+        fi
+
+        delimiter="EOF_$(date +%s)_${RANDOM}"
+        {
+          echo "version=${version}"
+          echo "found=${found}"
+          echo "notes-file=${notes_file}"
+          echo "notes<<${delimiter}"
+          cat "$notes_file"
+          echo "${delimiter}"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "Rendered release notes for ${version}:"
+        cat "$notes_file"

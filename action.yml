@@ -1,0 +1,175 @@
+name: Setup elastic-package
+description: >-
+  Install the elastic-package CLI on a Linux runner, verified against the
+  release checksums and cached between runs.
+author: Nate Shoffner
+
+branding:
+  icon: package
+  color: blue
+
+inputs:
+  version:
+    description: >-
+      elastic-package release to install, with or without the leading "v"
+      (for example "v0.126.4" or "0.126.4").
+    required: false
+    default: v0.126.4
+  cache:
+    description: >-
+      Cache the downloaded binary with actions/cache, keyed on the version and
+      the runner architecture. Set to "false" on runners without a cache
+      service.
+    required: false
+    default: 'true'
+
+outputs:
+  version:
+    description: The installed elastic-package version, without the leading "v".
+    value: ${{ steps.resolve.outputs.version }}
+  install-path:
+    description: Directory holding the elastic-package binary, added to PATH.
+    value: ${{ steps.resolve.outputs.install-path }}
+  cache-hit:
+    description: '"true" when the binary was restored from the cache.'
+    value: ${{ steps.cache.outputs.cache-hit == 'true' }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve version and architecture
+      id: resolve
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        version="${INPUT_VERSION#v}"
+        if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+          echo "::error::Unexpected elastic-package version '${INPUT_VERSION}'; expected something like v0.126.4"
+          exit 1
+        fi
+
+        kernel="$(uname -s)"
+        if [ "$kernel" != "Linux" ]; then
+          echo "::error::This action installs the Linux builds of elastic-package; the runner reported '${kernel}'"
+          exit 1
+        fi
+
+        machine="$(uname -m)"
+        case "$machine" in
+          x86_64|amd64) arch=amd64 ;;
+          aarch64|arm64) arch=arm64 ;;
+          *)
+            echo "::error::Unsupported architecture '${machine}'; this action installs linux amd64 or arm64 builds only"
+            exit 1
+            ;;
+        esac
+
+        # RUNNER_TOOL_CACHE is set on GitHub-hosted runners but not on every
+        # self-hosted one, so fall back to a path that survives the job.
+        tool_cache="${RUNNER_TOOL_CACHE:-${HOME}/.cache/elastic-package-action}"
+        install_path="${tool_cache}/elastic-package/${version}/${arch}"
+
+        {
+          echo "version=${version}"
+          echo "arch=${arch}"
+          echo "install-path=${install_path}"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "Resolved elastic-package ${version} for linux/${arch}"
+
+    - name: Restore cached elastic-package
+      id: cache
+      if: inputs.cache == 'true'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ steps.resolve.outputs.install-path }}
+        key: elastic-package-${{ steps.resolve.outputs.version }}-linux-${{ steps.resolve.outputs.arch }}
+
+    - name: Check for an existing binary
+      id: probe
+      shell: bash
+      env:
+        INSTALL_PATH: ${{ steps.resolve.outputs.install-path }}
+      run: |
+        set -euo pipefail
+        # The cache may be disabled, a miss, or a partial restore, so decide
+        # from the binary itself rather than from cache-hit alone.
+        if [ -x "${INSTALL_PATH}/elastic-package" ]; then
+          echo "needs-install=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "needs-install=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Download and verify elastic-package
+      if: steps.probe.outputs.needs-install == 'true'
+      shell: bash
+      env:
+        VERSION: ${{ steps.resolve.outputs.version }}
+        ARCH: ${{ steps.resolve.outputs.arch }}
+        INSTALL_PATH: ${{ steps.resolve.outputs.install-path }}
+      run: |
+        set -euo pipefail
+
+        base="https://github.com/elastic/elastic-package/releases/download/v${VERSION}"
+        archive="elastic-package_${VERSION}_linux_${ARCH}.tar.gz"
+        checksums="elastic-package_${VERSION}_checksums.txt"
+
+        workdir="$(mktemp -d)"
+        trap 'rm -rf "$workdir"' EXIT
+
+        echo "Downloading ${base}/${archive}"
+        if ! curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+          --output "${workdir}/${archive}" "${base}/${archive}"; then
+          echo "::error::Could not download ${archive}; check that elastic-package v${VERSION} publishes a linux ${ARCH} build"
+          exit 1
+        fi
+
+        # No checksums file means no way to verify the binary. Fail instead of
+        # installing something unverified.
+        if ! curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+          --output "${workdir}/${checksums}" "${base}/${checksums}"; then
+          echo "::error::elastic-package v${VERSION} does not publish ${checksums}; refusing to install an unverified binary"
+          exit 1
+        fi
+
+        cd "$workdir"
+
+        # Keep only the line for the archive just downloaded, so a checksums
+        # file that omits this build fails rather than verifying nothing.
+        if ! awk -v want="$archive" \
+          '$2 == want || $2 == "*" want { print; found = 1 } END { exit found ? 0 : 1 }' \
+          "$checksums" > expected.sha256; then
+          echo "::error::${checksums} has no entry for ${archive}; refusing to install an unverified binary"
+          exit 1
+        fi
+
+        entries="$(wc -l < expected.sha256)"
+        if [ "$entries" -ne 1 ]; then
+          echo "::error::${checksums} has ${entries} entries for ${archive}; expected exactly one"
+          exit 1
+        fi
+
+        sha256sum --check --strict expected.sha256
+
+        mkdir -p "$INSTALL_PATH"
+        tar -xzf "$archive" -C "$INSTALL_PATH" elastic-package
+        chmod +x "${INSTALL_PATH}/elastic-package"
+
+    - name: Add elastic-package to PATH
+      shell: bash
+      env:
+        INSTALL_PATH: ${{ steps.resolve.outputs.install-path }}
+      run: |
+        set -euo pipefail
+
+        if [ ! -x "${INSTALL_PATH}/elastic-package" ]; then
+          echo "::error::elastic-package was not installed at ${INSTALL_PATH}; re-run with cache: false if a stale cache entry is to blame"
+          exit 1
+        fi
+
+        echo "$INSTALL_PATH" >> "$GITHUB_PATH"
+        # GITHUB_PATH only applies to later steps, so call it by full path here.
+        "${INSTALL_PATH}/elastic-package" version

@@ -1,0 +1,6 @@
+# This repository ships composite actions, not a Python package; the only
+# Python here is the helper scripts and their tests.
+[tool.pytest.ini_options]
+pythonpath = ["scripts"]
+testpaths = ["tests"]
+addopts = "-q"

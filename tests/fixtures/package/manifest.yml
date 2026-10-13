@@ -1,0 +1,5 @@
+# Minimal manifest used by the self-test workflow, not a real package.
+format_version: 3.0.0
+name: fixture
+title: Fixture Package
+version: 1.2.0

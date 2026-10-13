@@ -1,0 +1,13 @@
+# Minimal changelog used by the self-test workflow, not a real package.
+- version: "1.2.0"
+  changes:
+    - description: Add the metrics data stream
+      type: enhancement
+      link: https://github.com/NateShoffner/elastic-package-action/pull/1
+    - description: Fix the timestamp mapping
+      type: bugfix
+      link: https://github.com/NateShoffner/elastic-package-action/pull/2
+- version: "1.1.0"
+  changes:
+    - description: Initial release
+      type: enhancement

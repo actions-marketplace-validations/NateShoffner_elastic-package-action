@@ -1,0 +1,68 @@
+name: Verify package version
+description: >-
+  Fail the job when the release tag does not match the version declared in an
+  Elastic package manifest.yml.
+author: Nate Shoffner
+
+branding:
+  icon: check-circle
+  color: blue
+
+inputs:
+  manifest-path:
+    description: Path to the package manifest.yml.
+    required: false
+    default: manifest.yml
+  tag:
+    description: Release tag to check. Defaults to the tag or branch that triggered the run.
+    required: false
+    default: ${{ github.ref_name }}
+  tag-prefix:
+    description: >-
+      Prefix stripped from the tag before comparing it with the manifest
+      version. Pass an empty string for unprefixed tags. A tag that does not
+      start with this prefix is an error.
+    required: false
+    default: v
+
+outputs:
+  version:
+    description: The verified package version, without the tag prefix.
+    value: ${{ steps.verify.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Ensure PyYAML is available
+      shell: bash
+      run: |
+        set -euo pipefail
+        if python3 -c 'import yaml' 2>/dev/null; then
+          exit 0
+        fi
+        # Ubuntu runner images mark the system interpreter as externally
+        # managed (PEP 668), so retry with the override before giving up.
+        python3 -m pip install --quiet --disable-pip-version-check pyyaml \
+          || python3 -m pip install --quiet --disable-pip-version-check --break-system-packages pyyaml \
+          || {
+               echo "::error::PyYAML is required by this action; run actions/setup-python or install python3-yaml before it"
+               exit 1
+             }
+
+    - name: Verify tag matches manifest version
+      id: verify
+      shell: bash
+      env:
+        MANIFEST_PATH: ${{ inputs.manifest-path }}
+        TAG: ${{ inputs.tag }}
+        TAG_PREFIX: ${{ inputs.tag-prefix }}
+        # Scripts are shared by the actions in this repository, so they live at
+        # the repository root rather than inside each action directory.
+        SCRIPT: ${{ github.action_path }}/../scripts/verify_version.py
+      run: |
+        set -euo pipefail
+        version="$(python3 "$SCRIPT" \
+          --manifest "$MANIFEST_PATH" \
+          --tag "$TAG" \
+          --tag-prefix "$TAG_PREFIX")"
+        echo "version=${version}" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,165 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.11', '3.13']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+      - run: python -m pytest
+
+  setup:
+    name: Install elastic-package (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned default version
+        id: setup
+        uses: ./
+
+      - name: Check the binary and outputs
+        env:
+          VERSION: ${{ steps.setup.outputs.version }}
+          INSTALL_PATH: ${{ steps.setup.outputs.install-path }}
+        run: |
+          set -euo pipefail
+          test -n "$VERSION"
+          test -x "${INSTALL_PATH}/elastic-package"
+          command -v elastic-package
+          elastic-package version | tee /dev/stderr | grep -F "$VERSION"
+
+      - name: Install again to confirm the install is reused
+        id: again
+        uses: ./
+
+      - name: Check the second install reused the same path
+        env:
+          FIRST: ${{ steps.setup.outputs.install-path }}
+          SECOND: ${{ steps.again.outputs.install-path }}
+        run: |
+          set -euo pipefail
+          test "$FIRST" = "$SECOND"
+          elastic-package version
+
+      - name: Reject an unknown version
+        id: bad-version
+        continue-on-error: true
+        uses: ./
+        with:
+          version: v0.0.0-does-not-exist
+
+      - name: Check the unknown version failed
+        if: steps.bad-version.outcome != 'failure'
+        run: |
+          echo "::error::Installing a non-existent version should have failed"
+          exit 1
+
+  subpath-actions:
+    name: verify-version and release-notes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify a matching tag
+        id: verify
+        uses: ./verify-version
+        with:
+          manifest-path: tests/fixtures/package/manifest.yml
+          tag: v1.2.0
+
+      - name: Check the verified version
+        run: |
+          set -euo pipefail
+          test "${{ steps.verify.outputs.version }}" = "1.2.0"
+
+      - name: Verify a tag with a custom prefix
+        uses: ./verify-version
+        with:
+          manifest-path: tests/fixtures/package/manifest.yml
+          tag: fixture-1.2.0
+          tag-prefix: fixture-
+
+      - name: Reject a mismatched tag
+        id: mismatch
+        continue-on-error: true
+        uses: ./verify-version
+        with:
+          manifest-path: tests/fixtures/package/manifest.yml
+          tag: v9.9.9
+
+      - name: Check the mismatch failed
+        if: steps.mismatch.outcome != 'failure'
+        run: |
+          echo "::error::A mismatched tag should have failed the job"
+          exit 1
+
+      - name: Render release notes
+        id: notes
+        uses: ./release-notes
+        with:
+          changelog-path: tests/fixtures/package/changelog.yml
+          tag: v1.2.0
+
+      - name: Check the rendered notes
+        env:
+          NOTES: ${{ steps.notes.outputs.notes }}
+          NOTES_FILE: ${{ steps.notes.outputs.notes-file }}
+        run: |
+          set -euo pipefail
+          test "${{ steps.notes.outputs.version }}" = "1.2.0"
+          test "${{ steps.notes.outputs.found }}" = "true"
+          test -f "$NOTES_FILE"
+          grep -qF 'Add the metrics data stream (`enhancement`) [#1]' "$NOTES_FILE"
+          grep -qF 'Upload integration' "$NOTES_FILE"
+          printf '%s' "$NOTES" | grep -qF 'Fix the timestamp mapping (`bugfix`)'
+
+      - name: Render notes for a version with no changelog entry
+        id: missing
+        uses: ./release-notes
+        with:
+          changelog-path: tests/fixtures/package/changelog.yml
+          version: 9.9.9
+          footer: ''
+
+      - name: Check the placeholder notes
+        run: |
+          set -euo pipefail
+          test "${{ steps.missing.outputs.found }}" = "false"
+          grep -qF 'No changelog entry found for 9.9.9.' "${{ steps.missing.outputs.notes-file }}"
+
+      - name: Fail on a missing changelog entry when asked
+        id: missing-fatal
+        continue-on-error: true
+        uses: ./release-notes
+        with:
+          changelog-path: tests/fixtures/package/changelog.yml
+          version: 9.9.9
+          fail-if-missing: 'true'
+
+      - name: Check fail-if-missing failed
+        if: steps.missing-fatal.outcome != 'failure'
+        run: |
+          echo "::error::fail-if-missing should have failed the job"
+          exit 1
